@@ -582,6 +582,325 @@ def extract_serialized_price(source):
     )
 
 
+def compact_count(value):
+    if value is None:
+        return None
+
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return None
+
+    if value >= 1_000_000:
+        amount = value / 1_000_000
+        rendered = f"{amount:.1f}".rstrip("0").rstrip(".")
+        return rendered.replace(".", ",") + " MI"
+
+    if value >= 1_000:
+        amount = value / 1_000
+        rendered = f"{amount:.1f}".rstrip("0").rstrip(".")
+        return rendered.replace(".", ",") + " MIL"
+
+    return str(value)
+
+
+def extract_installments(soup, source):
+    page_text = clean(
+        soup.get_text(" ", strip=True)
+    ) or ""
+
+    patterns = (
+        r'(\d{1,2})x\s+de\s+(R\$\s*[\d.]+,\d{2})\s+sem\s+juros',
+        r'(\d{1,2})\s*x\s*(R\$\s*[\d.]+,\d{2})\s+sem\s+juros',
+        r'em\s+(\d{1,2})x\s+de\s+(R\$\s*[\d.]+,\d{2})\s+sem\s+juros',
+    )
+
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            page_text,
+            re.IGNORECASE,
+        )
+
+        if match:
+            return {
+                "count": int(match.group(1)),
+                "amount_text": clean(match.group(2)),
+                "no_interest": True,
+            }
+
+    normalized = html.unescape(source)
+
+    count_match = re.search(
+        r'"installments"\s*:\s*(\d{1,2})',
+        normalized,
+        re.IGNORECASE,
+    )
+
+    amount_match = re.search(
+        r'"installment_amount"\s*:\s*"?([0-9]+(?:[.,][0-9]+)?)"?',
+        normalized,
+        re.IGNORECASE,
+    )
+
+    if count_match and amount_match:
+        amount = number(
+            amount_match.group(1)
+        )
+
+        if amount is not None:
+            return {
+                "count": int(count_match.group(1)),
+                "amount_text": brl(amount),
+                "no_interest": bool(
+                    re.search(
+                        r'"interest_rate"\s*:\s*0(?:\.0+)?',
+                        normalized,
+                        re.IGNORECASE,
+                    )
+                ),
+            }
+
+    return None
+
+
+def extract_rating_and_reviews(soup):
+    page_text = clean(
+        soup.get_text(" ", strip=True)
+    ) or ""
+
+    rating = None
+    reviews = None
+
+    rating_patterns = (
+        r'([0-5](?:[.,]\d)?)\s*(?:de\s*5|/5)',
+        r'Avalia[cç][aã]o\s*([0-5](?:[.,]\d)?)',
+    )
+
+    for pattern in rating_patterns:
+        match = re.search(
+            pattern,
+            page_text,
+            re.IGNORECASE,
+        )
+
+        if match:
+            candidate = number(
+                match.group(1)
+            )
+
+            if (
+                candidate is not None
+                and 0 <= candidate <= 5
+            ):
+                rating = candidate
+                break
+
+    review_patterns = (
+        r'([\d.]+)\s+opini[oõ]es',
+        r'([\d.]+)\s+avalia[cç][oõ]es',
+    )
+
+    for pattern in review_patterns:
+        match = re.search(
+            pattern,
+            page_text,
+            re.IGNORECASE,
+        )
+
+        if match:
+            try:
+                reviews = int(
+                    re.sub(
+                        r"\D",
+                        "",
+                        match.group(1),
+                    )
+                )
+            except ValueError:
+                pass
+            break
+
+    return rating, reviews
+
+
+def extract_ranking(soup):
+    page_text = clean(
+        soup.get_text(" ", strip=True)
+    ) or ""
+
+    found = []
+
+    if re.search(
+        r'\bmais\s+vendido\b',
+        page_text,
+        re.IGNORECASE,
+    ):
+        found.append("🏆 <b>MAIS VENDIDO</b>")
+
+    ranking_match = re.search(
+        r'\b([1-9]\d*)[º°]\s+em\s+([A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9 &/\\-]{2,50})',
+        page_text,
+        re.IGNORECASE,
+    )
+
+    if ranking_match:
+        position = ranking_match.group(1)
+        category = clean(
+            ranking_match.group(2)
+        )
+
+        if category:
+            category = re.split(
+                r'\s{2,}|Comprar|Frete|Avalia|R\$',
+                category,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0].strip(" -|")
+
+            if category:
+                medal = (
+                    "🥇" if position == "1"
+                    else "🥈" if position == "2"
+                    else "🥉" if position == "3"
+                    else "🏅"
+                )
+
+                found.append(
+                    f"{medal} <b>{html.escape(position + 'º em ' + category)}</b>"
+                )
+
+    return found[:2]
+
+
+def extract_features(soup, title):
+    candidates = []
+
+    selectors = (
+        ".ui-pdp-features__item",
+        ".ui-pdp-highlights__content li",
+        ".ui-pdp-specs__table tr",
+        ".ui-pdp-specs__body tr",
+        ".andes-list__item",
+    )
+
+    for selector in selectors:
+        for tag in soup.select(selector):
+            value = clean(
+                tag.get_text(
+                    " ",
+                    strip=True,
+                )
+            )
+
+            if not value:
+                continue
+
+            if len(value) < 4 or len(value) > 120:
+                continue
+
+            lower = value.lower()
+
+            blocked = (
+                "mercado pago",
+                "devolução",
+                "devolucao",
+                "estoque",
+                "vendido por",
+                "formas de pagamento",
+                "meios de pagamento",
+                "perguntas e respostas",
+                "mais produtos",
+            )
+
+            if any(
+                word in lower
+                for word in blocked
+            ):
+                continue
+
+            if value not in candidates:
+                candidates.append(value)
+
+            if len(candidates) >= 7:
+                return candidates
+
+    return candidates[:7]
+
+
+def feature_emoji(feature):
+    lower = feature.lower()
+
+    rules = (
+        (("litro", "capacidade"), "🍽️"),
+        (("w", "potência", "potencia"), "⚡"),
+        (("display", "tela"), "🖥️"),
+        (("espelh", "acabamento"), "✨"),
+        (("segurança", "seguranca", "bloqueio"), "🔒"),
+        (("cm", "mm", "dimens"), "📏"),
+        (("127v", "220v", "voltagem", "voltage"), "🔌"),
+        (("bluetooth", "wireless", "sem fio"), "📶"),
+        (("bateria", "mah", "autonomia"), "🔋"),
+        (("gb", "tb", "armazen"), "💾"),
+        (("hz", "fps"), "🎮"),
+        (("câmera", "camera", "mp"), "📸"),
+    )
+
+    for keys, emoji in rules:
+        if any(
+            key in lower
+            for key in keys
+        ):
+            return emoji
+
+    return "✅"
+
+
+def product_emoji(title):
+    lower = (title or "").lower()
+
+    rules = (
+        (("micro-ondas", "microondas", "air fryer", "panela", "cozinha"), "🍽️"),
+        (("teclado", "mouse", "headset", "controle", "gamer"), "🎮"),
+        (("celular", "smartphone", "iphone", "galaxy", "redmi", "motorola"), "📱"),
+        (("tv", "televisor", "monitor"), "📺"),
+        (("fone", "earbuds"), "🎧"),
+        (("moto", "capacete", "baú", "bau"), "🏍️"),
+        (("carro", "automotivo"), "🚗"),
+        (("tênis", "tenis", "camiseta", "roupa", "calça", "vestido"), "👕"),
+    )
+
+    for keys, emoji in rules:
+        if any(
+            key in lower
+            for key in keys
+        ):
+            return emoji
+
+    return "🔥"
+
+
+def sales_pitch(product):
+    title = (
+        product.get("title")
+        or "esse produto"
+    )
+
+    if (
+        product.get("discount")
+        and product.get("price") is not None
+    ):
+        return (
+            f"👀 <b>Com {product['discount']}% de desconto, "
+            "vale conferir se você já estava de olho nesse tipo de produto.</b>"
+        )
+
+    return (
+        "👀 <b>Uma opção pra conferir se você estava procurando "
+        "esse tipo de produto e o valor fizer sentido pra você.</b>"
+    )
+
+
 # ============================================================
 # MERCADO LIVRE
 # ============================================================
@@ -732,6 +1051,11 @@ def scrape_product(
         "free_shipping": None,
         "full": None,
         "image": None,
+        "installments": None,
+        "rating": None,
+        "reviews": None,
+        "ranking": [],
+        "features": [],
         "item_id": find_item_id(
             final_url,
             source,
@@ -807,6 +1131,57 @@ def scrape_product(
                 product["title"] = clean(
                     node.get("name")
                 )
+
+
+            aggregate_rating = node.get(
+                "aggregateRating"
+            )
+
+            if isinstance(
+                aggregate_rating,
+                dict,
+            ):
+
+                if product["rating"] is None:
+
+                    product["rating"] = number(
+                        aggregate_rating.get(
+                            "ratingValue"
+                        )
+                    )
+
+                if product["reviews"] is None:
+
+                    reviews_value = (
+                        aggregate_rating.get(
+                            "reviewCount"
+                        )
+                        or aggregate_rating.get(
+                            "ratingCount"
+                        )
+                    )
+
+                    if reviews_value is not None:
+
+                        try:
+                            product["reviews"] = int(
+                                float(
+                                    str(
+                                        reviews_value
+                                    ).replace(
+                                        ".",
+                                        ""
+                                    ).replace(
+                                        ",",
+                                        "."
+                                    )
+                                )
+                            )
+                        except (
+                            TypeError,
+                            ValueError,
+                        ):
+                            pass
 
 
             if not product["image"]:
@@ -1048,6 +1423,41 @@ def scrape_product(
     normalized = html.unescape(
         source
     )
+
+
+    if product["installments"] is None:
+        product["installments"] = extract_installments(
+            soup,
+            source,
+        )
+
+
+    if (
+        product["rating"] is None
+        or product["reviews"] is None
+    ):
+        rating, reviews = extract_rating_and_reviews(
+            soup
+        )
+
+        if product["rating"] is None:
+            product["rating"] = rating
+
+        if product["reviews"] is None:
+            product["reviews"] = reviews
+
+
+    if not product["ranking"]:
+        product["ranking"] = extract_ranking(
+            soup
+        )
+
+
+    if not product["features"]:
+        product["features"] = extract_features(
+            soup,
+            product["title"],
+        )
 
 
     if product["price"] is None:
@@ -1349,7 +1759,8 @@ def scrape_product(
         (
             "Produto extraído | item=%s | "
             "titulo=%r | preco=%s | anterior=%s | "
-            "desconto=%s | frete_gratis=%s | full=%s | imagem=%s"
+            "desconto=%s | frete_gratis=%s | full=%s | imagem=%s | "
+            "parcelas=%s | nota=%s | avaliacoes=%s | ranking=%s | recursos=%s"
         ),
         product["item_id"],
         product["title"],
@@ -1359,6 +1770,11 @@ def scrape_product(
         product["free_shipping"],
         product["full"],
         bool(product["image"]),
+        product.get("installments"),
+        product.get("rating"),
+        product.get("reviews"),
+        product.get("ranking"),
+        len(product.get("features", [])),
     )
 
     return product
@@ -1380,143 +1796,279 @@ def build_offer(
         or "Produto em oferta"
     )
 
-
     if len(title) > 180:
-
         title = (
             title[:177].rstrip()
             + "..."
         )
 
+    discount = product.get(
+        "discount"
+    )
+
+    emoji = product_emoji(
+        title
+    )
+
+    headline = title.upper()
+
+    if (
+        discount
+        and discount > 0
+    ):
+        headline += (
+            f" COM {discount}% OFF!"
+        )
+    else:
+        headline += " EM OFERTA!"
 
     lines = [
-        "🔥 <b>OFERTA MZONE TECH</b>",
+        (
+            f"{emoji} <b>"
+            + html.escape(headline)
+            + "</b> 🔥"
+        ),
         "",
         (
-            "🎯 <b>"
+            "✨ <b>"
             + html.escape(title)
             + "</b>"
         ),
+        "",
     ]
 
 
     if (
-        product["original_price"]
-        and product["price"]
+        product.get(
+            "original_price"
+        )
+        and product.get(
+            "price"
+        )
     ):
-
-        price_line = (
-            "💰 De <s>"
+        lines.append(
+            "💰 De <b>"
             + brl(
                 product[
                     "original_price"
                 ]
             )
-            + "</s> por <b>"
+            + "</b>"
+        )
+
+        current_line = (
+            "🔥 <b>POR "
             + brl(
                 product[
                     "price"
                 ]
             )
-            + "</b>"
+        )
+
+        if discount:
+            current_line += (
+                f" — {discount}% OFF"
+            )
+
+        current_line += "</b>"
+
+        lines.append(
+            current_line
         )
 
     else:
-
-        price_line = (
-            "💰 <b>"
+        lines.append(
+            "🔥 <b>POR "
             + brl(
-                product[
-                    "price"
-                ]
+                product["price"]
             )
             + "</b>"
         )
 
 
-    if product["discount"]:
+    installments = product.get(
+        "installments"
+    )
 
-        price_line += (
-            " — <b>"
-            + str(
-                product[
-                    "discount"
-                ]
+    if installments:
+        installment_line = (
+            f"💳 <b>{installments['count']}x de "
+            f"{html.escape(installments['amount_text'])}"
+        )
+
+        if installments.get(
+            "no_interest"
+        ):
+            installment_line += (
+                " sem juros"
             )
-            + "% OFF</b>"
+
+        installment_line += "</b>"
+
+        lines.append(
+            installment_line
         )
 
 
-    lines.append(
-        price_line
+    social_proof = []
+
+    for item in product.get(
+        "ranking",
+        []
+    ):
+        social_proof.append(
+            item
+        )
+
+
+    rating = product.get(
+        "rating"
     )
 
+    reviews = product.get(
+        "reviews"
+    )
 
-    shipping = []
+    if rating is not None:
+        rating_text = (
+            str(
+                round(
+                    rating,
+                    1,
+                )
+            )
+            .replace(
+                ".",
+                ",",
+            )
+        )
 
+        rating_line = (
+            "⭐ <b>"
+            + rating_text
+            + "/5"
+        )
+
+        compact_reviews = compact_count(
+            reviews
+        )
+
+        if compact_reviews:
+            rating_line += (
+                " com +"
+                + compact_reviews
+                + " avaliações"
+            )
+
+        rating_line += "</b> 😱"
+
+        social_proof.append(
+            rating_line
+        )
+
+
+    if social_proof:
+        lines.append("")
+        lines.extend(
+            social_proof[:3]
+        )
+
+
+    features = product.get(
+        "features",
+        []
+    )
+
+    if features:
+        lines.append("")
+
+        for feature in features[:7]:
+            lines.append(
+                feature_emoji(
+                    feature
+                )
+                + " <b>"
+                + html.escape(
+                    feature
+                )
+                + "</b>"
+            )
+
+
+    shipping_lines = []
 
     if (
-        product[
+        product.get(
             "free_shipping"
-        ]
+        )
         is True
     ):
-
-        shipping.append(
+        shipping_lines.append(
             "🚚 <b>Frete grátis</b>"
         )
 
-
     if (
-        product["full"]
+        product.get(
+            "full"
+        )
         is True
     ):
-
-        shipping.append(
+        shipping_lines.append(
             "⚡ <b>FULL</b>"
         )
 
-
-    if shipping:
-
-        lines.append(
-            " • ".join(
-                shipping
-            )
+    if shipping_lines:
+        lines.append("")
+        lines.extend(
+            shipping_lines
         )
 
 
-    # IMPORTANTE:
-    # este é EXATAMENTE o link que
-    # o administrador enviou ao bot.
-    #
-    # Não troca por link final,
-    # não encurta e não gera outro.
+    lines.extend(
+        [
+            "",
+            sales_pitch(product),
+            "",
+        ]
+    )
+
+
+    voltage_found = any(
+        re.search(
+            r'\b(?:127|220)\s*v\b|voltagem',
+            feature,
+            re.IGNORECASE,
+        )
+        for feature in features
+    )
+
+    if voltage_found:
+        lines.append(
+            "⚠️ <b>Confira a voltagem antes da compra. "
+            "Preço e disponibilidade podem mudar.</b>"
+        )
+    else:
+        lines.append(
+            "⚠️ <b>Preço e disponibilidade podem mudar.</b>"
+        )
+
 
     exact_link = html.escape(
         original_url,
         quote=False,
     )
 
-
     lines.extend(
         [
             "",
-            (
-                "⚡ Vale conferir enquanto "
-                "esse valor estiver disponível."
-            ),
-            "",
-            (
-                "🛒 <b>Comprar no "
-                "Mercado Livre:</b>"
-            ),
-            exact_link,
+            "👉 <b>VER OFERTA:</b>",
+            "🔗 <b>"
+            + exact_link
+            + "</b>",
         ]
     )
 
-
-    return "\n".join(
+    return "\\n".join(
         lines
     )
 
