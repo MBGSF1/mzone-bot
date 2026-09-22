@@ -114,6 +114,7 @@ ML_DOMAINS = (
     "mercadolivre.com.br",
     "mercadolivre.com",
     "mercadolibre.com",
+     "me.li",
 )
 
 
