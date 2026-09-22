@@ -421,6 +421,167 @@ def first_regex_number(
     return None
 
 
+def money_from_andes_amount(tag):
+    """
+    Lê os componentes visuais de preço usados pelo Mercado Livre:
+    .andes-money-amount__fraction e .andes-money-amount__cents
+    """
+    if not tag:
+        return None
+
+    fraction_tag = tag.select_one(".andes-money-amount__fraction")
+    cents_tag = tag.select_one(".andes-money-amount__cents")
+
+    if not fraction_tag:
+        return None
+
+    fraction_digits = re.sub(
+        r"\D",
+        "",
+        fraction_tag.get_text(" ", strip=True),
+    )
+
+    if not fraction_digits:
+        return None
+
+    value = float(fraction_digits)
+
+    if cents_tag:
+        cents_digits = re.sub(
+            r"\D",
+            "",
+            cents_tag.get_text(" ", strip=True),
+        )
+
+        if cents_digits:
+            cents_digits = cents_digits[:2].ljust(2, "0")
+            value += int(cents_digits) / 100
+
+    return value
+
+
+def tag_is_old_or_installment_price(tag):
+    """
+    Evita confundir preço antigo ou valor de parcela com o preço atual.
+    """
+    current = tag
+
+    for _ in range(5):
+        if current is None:
+            break
+
+        classes = " ".join(
+            current.get("class", [])
+            if hasattr(current, "get")
+            else []
+        ).lower()
+
+        if any(
+            marker in classes
+            for marker in (
+                "original",
+                "previous",
+                "installment",
+                "installments",
+                "discount",
+            )
+        ):
+            return True
+
+        if getattr(current, "name", None) in ("s", "del"):
+            return True
+
+        current = getattr(current, "parent", None)
+
+    return False
+
+
+def extract_current_price_from_dom(soup):
+    """
+    Procura primeiro os seletores específicos do preço principal do
+    Mercado Livre e só depois usa um fallback mais amplo.
+    """
+    selectors = (
+        ".ui-pdp-price__second-line .andes-money-amount",
+        ".ui-pdp-price__main-container .andes-money-amount",
+        ".ui-pdp-price__main-container [itemprop='price']",
+        "[data-testid='price-part'] .andes-money-amount",
+        ".ui-pdp-price__second-line [itemprop='price']",
+    )
+
+    for selector in selectors:
+        for tag in soup.select(selector):
+            content = (
+                tag.get("content")
+                or tag.get("value")
+            )
+
+            parsed = number(content)
+
+            if parsed is None:
+                parsed = money_from_andes_amount(tag)
+
+            if parsed is not None and parsed > 0:
+                return parsed
+
+    # Fallback: procura um andes-money-amount que não seja
+    # preço anterior nem parcela.
+    for tag in soup.select(".andes-money-amount"):
+        if tag_is_old_or_installment_price(tag):
+            continue
+
+        parsed = money_from_andes_amount(tag)
+
+        if parsed is not None and parsed > 0:
+            return parsed
+
+    return None
+
+
+def extract_original_price_from_dom(soup):
+    selectors = (
+        ".ui-pdp-price__original-value .andes-money-amount",
+        ".ui-pdp-price__original-value",
+        ".andes-money-amount--previous",
+        "s.andes-money-amount",
+        "del.andes-money-amount",
+    )
+
+    for selector in selectors:
+        for tag in soup.select(selector):
+            parsed = money_from_andes_amount(tag)
+
+            if parsed is None:
+                parsed = number(
+                    tag.get("content")
+                    or tag.get_text(" ", strip=True)
+                )
+
+            if parsed is not None and parsed > 0:
+                return parsed
+
+    return None
+
+
+def extract_serialized_price(source):
+    """
+    Fallback para preços presentes em JSON/estado serializado da página.
+    Os padrões mais específicos vêm primeiro para reduzir falso positivo.
+    """
+    patterns = (
+        r'"current_price"\s*:\s*"?([0-9]+(?:[.,][0-9]+)?)"?',
+        r'"currentPrice"\s*:\s*\{[^{}]{0,250}?"(?:value|amount)"\s*:\s*"?([0-9]+(?:[.,][0-9]+)?)"?',
+        r'"price"\s*:\s*\{[^{}]{0,250}?"(?:value|amount)"\s*:\s*"?([0-9]+(?:[.,][0-9]+)?)"?',
+        r'"price"\s*:\s*"?([0-9]+(?:[.,][0-9]+)?)"?',
+        r'"priceValue"\s*:\s*"?([0-9]+(?:[.,][0-9]+)?)"?',
+    )
+
+    return first_regex_number(
+        html.unescape(source),
+        patterns,
+    )
+
+
 # ============================================================
 # MERCADO LIVRE
 # ============================================================
@@ -845,19 +1006,43 @@ def scrape_product(
         product["price"] = number(
             meta(
                 soup,
-                property=(
-                    "product:price:amount"
-                ),
+                property="product:price:amount",
+            )
+            or meta(
+                soup,
+                property="og:price:amount",
             )
             or meta(
                 soup,
                 itemprop="price",
             )
+            or meta(
+                soup,
+                name="twitter:data1",
+            )
         )
 
 
     # ========================================================
-    # 3. DADOS SERIALIZADOS NO HTML
+    # 3. PREÇO VISUAL DA PÁGINA
+    # ========================================================
+
+    if product["price"] is None:
+
+        product["price"] = extract_current_price_from_dom(
+            soup
+        )
+
+
+    if product["original_price"] is None:
+
+        product["original_price"] = extract_original_price_from_dom(
+            soup
+        )
+
+
+    # ========================================================
+    # 4. DADOS SERIALIZADOS NO HTML
     # ========================================================
 
     normalized = html.unescape(
@@ -865,11 +1050,20 @@ def scrape_product(
     )
 
 
-    product[
-        "original_price"
-    ] = first_regex_number(
-        normalized,
-        [
+    if product["price"] is None:
+
+        product["price"] = extract_serialized_price(
+            source
+        )
+
+
+    if product["original_price"] is None:
+
+        product[
+            "original_price"
+        ] = first_regex_number(
+            normalized,
+            [
             (
                 r'"original_price"'
                 r'\s*:\s*"?'
@@ -888,8 +1082,8 @@ def scrape_product(
                 r'([0-9]+(?:[.,][0-9]+)?)'
                 r'"?'
             ),
-        ],
-    )
+            ],
+        )
 
 
     raw_discount = first_regex_number(
@@ -981,7 +1175,7 @@ def scrape_product(
 
 
     # ========================================================
-    # 4. FALLBACK /items
+    # 5. FALLBACK /items
     # ========================================================
 
     if product["item_id"]:
@@ -1107,7 +1301,7 @@ def scrape_product(
 
 
     # ========================================================
-    # 5. CALCULA O DESCONTO
+    # 6. CALCULA O DESCONTO
     # ========================================================
 
     if (
@@ -1150,6 +1344,22 @@ def scrape_product(
             "original_price"
         ] = None
 
+
+    logger.info(
+        (
+            "Produto extraído | item=%s | "
+            "titulo=%r | preco=%s | anterior=%s | "
+            "desconto=%s | frete_gratis=%s | full=%s | imagem=%s"
+        ),
+        product["item_id"],
+        product["title"],
+        product["price"],
+        product["original_price"],
+        product["discount"],
+        product["free_shipping"],
+        product["full"],
+        bool(product["image"]),
+    )
 
     return product
 
