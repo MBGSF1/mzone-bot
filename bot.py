@@ -2068,7 +2068,7 @@ def build_offer(
         ]
     )
 
-    return "\\n".join(
+    return "\n".join(
         lines
     )
 
